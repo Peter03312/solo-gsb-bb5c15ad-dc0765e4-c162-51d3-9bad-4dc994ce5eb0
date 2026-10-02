@@ -1,6 +1,7 @@
 """业务服务：危险区登记（全局修订号）、轨迹点批量提交、穿越审计计算。"""
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from datetime import datetime, timezone
@@ -989,3 +990,270 @@ class AuditService:
         if pinned_rev:
             result["revision"] = revision
         return result
+
+    # ------------------------------------------------------------------
+    # 危险区内近距离相遇复核
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_max_distance(raw: Any) -> float:
+        """校验米制距离阈值：必须是正且有限的数值（非法值 400）。"""
+        if isinstance(raw, bool):
+            raise ValidationError(f"max_distance 必须是正且有限的数值（米），收到: {raw!r}")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValidationError(f"max_distance 必须是正且有限的数值（米），收到: {raw!r}")
+        if not math.isfinite(value) or value <= 0:
+            raise ValidationError(f"max_distance 必须是正且有限的数值（米），收到: {raw!r}")
+        return value
+
+    def query_proximity(self, zone_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核指定危险区内两车是否曾在 [since, until) 内近距离相遇。
+
+        - 至少两辆互异车次；距离阈值正且有限（米），严格小于才计入；
+        - 可选区域修订号与逐车轨迹版本，未指定版本的车取查询时最新已提交状态；
+        - 区域与全部车次点集从**同一已提交读视图**读取，并发更新不会拼出不存在的组合；
+        - 只在两车均有轨迹覆盖且同时位于区内时比较同一时刻的平面距离
+          （沿用相邻点线性插值、区域生效窗口与带洞边界规则）；
+        - 按无序车次对返回距离严格小于阈值的正时长区间（起止、持续秒数、区间最小距离），
+          相接且连续满足条件的区间合并，瞬时触及忽略；合法但无相遇返回空列表。
+        """
+        if not isinstance(zone_id, str) or not zone_id.strip():
+            raise ValidationError("zone_id 必须是非空字符串")
+        zone_id = zone_id.strip()
+
+        # ---- 请求校验（时间范围 / 车次互异 / 距离阈值 / 逐车版本格式）----
+        trip_ids_raw = payload.get("trip_ids")
+        if not isinstance(trip_ids_raw, list) or len(trip_ids_raw) < 2:
+            raise ValidationError("trip_ids 必须包含至少两辆车次")
+        trip_ids: List[str] = []
+        for idx, tid in enumerate(trip_ids_raw):
+            if not isinstance(tid, str) or not tid.strip():
+                raise ValidationError(f"trip_ids[{idx}] 必须是非空字符串")
+            tid = tid.strip()
+            if tid in trip_ids:
+                raise ValidationError(f"trip_ids 中车次重复: {tid!r}（各车次必须互异）")
+            trip_ids.append(tid)
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        max_distance = self._validate_max_distance(payload.get("max_distance"))
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        track_versions_raw = payload.get("track_versions") or {}
+        if not isinstance(track_versions_raw, dict):
+            raise ValidationError("track_versions 必须是 {车次: 版本号} 对象")
+        pinned_versions: Dict[str, int] = {}
+        for tid, raw_v in track_versions_raw.items():
+            if tid not in trip_ids:
+                raise ValidationError(
+                    f"track_versions 包含未在 trip_ids 中的车次: {tid!r}"
+                )
+            pinned_versions[tid] = self._validate_track_version_value(raw_v)
+
+        # ---- 同一已提交读视图：区域 + 全部车次点集一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                zrow = self.db._zone_row_at(conn, zone_id, revision)
+                if zrow is None:
+                    raise NotFoundError(
+                        f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                    )
+            else:
+                zrow = self.db._latest_zone_row(conn, zone_id)
+                if zrow is None:
+                    raise NotFoundError(f"危险区不存在: {zone_id}")
+
+            per_trip: List[Tuple[str, int, List[Any]]] = []
+            for tid in trip_ids:
+                if tid in pinned_versions:
+                    version = pinned_versions[tid]
+                    baseline, head = self.db._trip_version_info(conn, tid)
+                    self._check_track_version_range(tid, version, baseline, head)
+                    points = self.db._list_trip_point_version_rows(conn, tid, version)
+                else:
+                    vrow = self.db._trip_version_row(conn, tid)
+                    points = self.db._list_trip_points(conn, tid)
+                    if vrow is None and not points:
+                        raise NotFoundError(f"车次不存在（无轨迹数据）: {tid}")
+                    version = 0 if vrow is None else int(vrow["version"])
+                per_trip.append((tid, version, points))
+
+            # 各车“轨迹覆盖且位于区内”的时间区间（同一快照数据，纯计算）
+            coverage: Dict[str, List[Tuple[float, float]]] = {
+                tid: self._coverage_intervals(zrow, points, lo, hi)
+                for tid, _version, points in per_trip
+            }
+
+        # ---- 无序车次对：仅在两车同时位于区内时比较同一时刻平面距离 ----
+        points_by_trip = {tid: points for tid, _version, points in per_trip}
+        pairs: List[Dict[str, Any]] = []
+        for i in range(len(trip_ids)):
+            for j in range(i + 1, len(trip_ids)):
+                tid_a, tid_b = trip_ids[i], trip_ids[j]
+                # 两车覆盖区间的半开交集：双方均有轨迹覆盖且同时位于区内的时间
+                common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
+                intervals = self._encounter_intervals(
+                    points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                )
+                if not intervals:
+                    continue
+                pairs.append(
+                    {
+                        "trip_ids": [tid_a, tid_b],
+                        "intervals": [
+                            {
+                                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                                "duration_sec": round(e - s, 6),
+                                "min_distance": round(min_d, 6),
+                            }
+                            for s, e, min_d in intervals
+                        ],
+                    }
+                )
+
+        result: Dict[str, Any] = {
+            "zone_id": zone_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "max_distance": max_distance,
+            "trips": [
+                {
+                    "trip_id": tid,
+                    "track_version": version,
+                    "point_count": len(points),
+                }
+                for tid, version, points in per_trip
+            ],
+            "pairs": pairs,
+        }
+        if pinned_rev:
+            result["revision"] = revision
+        return result
+
+    def _encounter_intervals(
+        self,
+        points_a: List[Any],
+        points_b: List[Any],
+        common: List[Tuple[float, float]],
+        max_distance: float,
+    ) -> List[Tuple[float, float, float]]:
+        """两车公共在区时间内、平面距离严格小于阈值的正时长区间（含区间最小距离）。
+
+        把公共区间按两车轨迹点时刻切成原子段：每段内两车各自线性运动，
+        相对位置随时间线性变化，距离平方为开口向上抛物线，解析求严格小于
+        阈值的子区间；相接（端点重合）且连续满足条件的区间合并，最小距离
+        取各段最小；零时长触及不产生区间。
+        """
+        ts_a = [r["ts_epoch"] for r in points_a]
+        ts_b = [r["ts_epoch"] for r in points_b]
+        candidates: List[Tuple[float, float, float]] = []
+        for s, e in common:
+            cuts = {s, e}
+            for t in ts_a:
+                if s < t < e:
+                    cuts.add(t)
+            for t in ts_b:
+                if s < t < e:
+                    cuts.add(t)
+            times = sorted(cuts)
+            for a, b in zip(times, times[1:]):
+                piece = self._close_interval_on_piece(
+                    points_a, ts_a, points_b, ts_b, a, b, max_distance
+                )
+                if piece is not None:
+                    candidates.append(piece)
+        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
+        merged: List[List[float]] = []
+        for s, e, min_d in candidates:
+            if merged and s - merged[-1][1] <= 1e-6:
+                merged[-1][1] = max(merged[-1][1], e)
+                merged[-1][2] = min(merged[-1][2], min_d)
+            else:
+                merged.append([s, e, min_d])
+        return [(s, e, md) for s, e, md in merged if e - s > self.min_duration]
+
+    def _close_interval_on_piece(
+        self,
+        points_a: List[Any],
+        ts_a: List[float],
+        points_b: List[Any],
+        ts_b: List[float],
+        a: float,
+        b: float,
+        max_distance: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        """原子段 [a, b] 内距离严格小于阈值的子区间 (s, e, 最小距离)；无则 None。"""
+        ax0, ay0 = self._position_at(points_a, ts_a, a)
+        ax1, ay1 = self._position_at(points_a, ts_a, b)
+        bx0, by0 = self._position_at(points_b, ts_b, a)
+        bx1, by1 = self._position_at(points_b, ts_b, b)
+        # 相对位置 r(u) = r0 + dv·u，u ∈ [0,1]；|r(u)|² < d² 为开口向上抛物线不等式
+        rx0, ry0 = ax0 - bx0, ay0 - by0
+        dvx, dvy = (ax1 - bx1) - rx0, (ay1 - by1) - ry0
+        qa = dvx * dvx + dvy * dvy
+        qc = rx0 * rx0 + ry0 * ry0 - max_distance * max_distance
+        if qa == 0.0:
+            # 相对静止：整段要么全满足要么全不满足
+            if qc < 0.0:
+                return (a, b, math.sqrt(rx0 * rx0 + ry0 * ry0))
+            return None
+        qb = 2.0 * (rx0 * dvx + ry0 * dvy)
+        disc = qb * qb - 4.0 * qa * qc
+        if disc <= 0.0:
+            return None  # 始终不满足，或仅瞬时相切（零时长触及忽略）
+        root = math.sqrt(disc)
+        u1 = (-qb - root) / (2.0 * qa)
+        u2 = (-qb + root) / (2.0 * qa)
+        lo_u, hi_u = max(u1, 0.0), min(u2, 1.0)
+        if hi_u <= lo_u:
+            return None
+        s = a + lo_u * (b - a)
+        e = a + hi_u * (b - a)
+        if e - s <= self.min_duration:
+            return None
+
+        def _dist(u: float) -> float:
+            rx = rx0 + dvx * u
+            ry = ry0 + dvy * u
+            return math.sqrt(rx * rx + ry * ry)
+
+        u_star = -qb / (2.0 * qa)  # 抛物线顶点：距离最小处
+        if lo_u <= u_star <= hi_u:
+            min_d = _dist(u_star)
+        else:
+            min_d = min(_dist(lo_u), _dist(hi_u))
+        return (s, e, min_d)
+
+    @staticmethod
+    def _position_at(
+        points: List[Any], ts: List[float], t: float
+    ) -> Tuple[float, float]:
+        """按相邻点线性插值取 t 时刻平面位置；t 须落在轨迹覆盖范围内。"""
+        idx = bisect.bisect_right(ts, t) - 1
+        idx = min(max(idx, 0), len(points) - 2)
+        pa, pb = points[idx], points[idx + 1]
+        t0, t1 = pa["ts_epoch"], pb["ts_epoch"]
+        ratio = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+        return (
+            pa["x"] + (pb["x"] - pa["x"]) * ratio,
+            pa["y"] + (pb["y"] - pa["y"]) * ratio,
+        )
