@@ -6,11 +6,18 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ZoneCreate
+from .schemas import (
+    CoOccupancyQuery,
+    CorrectionBatch,
+    PointBatch,
+    ProximityEncounterQuery,
+    ZoneCreate,
+)
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +33,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -37,6 +44,8 @@ app = FastAPI(
         "穿越审计可同时指定轨迹版本与区域修订号复现历史现场。"
         "多车同时占用审计按同一已提交读视图核算指定危险区在一段时间内"
         "被多辆作业车同时占用的时段，返回达到阈值的区间及区间内恒定的车次集合。"
+        "多车近距离相遇审计只在两车均有轨迹覆盖且同时位于区内时比较同一时刻的平面距离，"
+        "距离严格小于米制阈值的正时长区间按无序车次对返回（含区间最小距离）。"
     ),
 )
 
@@ -54,6 +63,27 @@ async def _conflict_handler(_: Request, exc: ConflictError) -> JSONResponse:
 @app.exception_handler(NotFoundError)
 async def _not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # 默认处理器会把 NaN/Infinity 原样回显，导致响应 JSON 自身非法（500）；
+    # 结构与 FastAPI 默认 422 保持一致（{"detail": [...]}），仅清洗非有限浮点等不可序列化值
+    def _sanitize(value):
+        if isinstance(value, float):
+            return value if value == value and value not in (float("inf"), float("-inf")) else str(value)
+        if isinstance(value, dict):
+            return {str(k): _sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize(v) for v in value]
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
+
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize(exc.errors())},
+    )
 
 
 @app.get("/health")
@@ -80,6 +110,7 @@ def index() -> dict:
             "GET  /api/v1/trips/{trip_id}/versions",
             "GET  /api/v1/trips/{trip_id}/crossings",
             "POST /api/v1/zones/{zone_id}/co-occupancy",
+            "POST /api/v1/zones/{zone_id}/proximity-encounters",
         ],
     }
 
@@ -227,6 +258,13 @@ def query_co_occupancy(zone_id: str, body: CoOccupancyQuery) -> dict:
     """多车同时占用审计：区域与全部车次点集从同一已提交读视图读取，
     返回 [since, until) 内达到占用阈值的半开区间及区间内恒定的车次集合。"""
     return service.query_co_occupancy(zone_id, body.model_dump())
+
+
+@app.post("/api/v1/zones/{zone_id}/proximity-encounters")
+def query_proximity_encounters(zone_id: str, body: ProximityEncounterQuery) -> dict:
+    """多车近距离相遇审计：只在两车均有轨迹覆盖且同时位于区内时比较同一时刻平面距离，
+    距离严格小于阈值的正时长半开区间按无序车次对返回，相接满足条件区间合并，瞬时触及忽略。"""
+    return service.query_proximity_encounters(zone_id, body.model_dump())
 
 
 if __name__ == "__main__":

@@ -989,3 +989,312 @@ class AuditService:
         if pinned_rev:
             result["revision"] = revision
         return result
+
+    # ------------------------------------------------------------------
+    # 多车近距离相遇审计
+    # ------------------------------------------------------------------
+
+    def query_proximity_encounters(self, zone_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """查明指定危险区在 [since, until) 内任意两车曾**近距离相遇**的正时长区间。
+
+        - 至少两辆互异车次；距离阈值必须为正且有限的米制数值；
+        - 可选区域修订号与逐车轨迹版本，未指定版本的车取查询时最新已提交状态；
+        - 区域与全部车次点集从**同一已提交读视图**读取；
+        - 仅在两车**同时位于区内**（沿用带洞边界、区域半开生效窗口、相邻点线性插值）
+          且**均有轨迹覆盖**时比较同一时刻的平面距离；
+        - 距离**严格小于**阈值的正时长（半开）区间按无序车次对返回，区间给起止、
+          持续秒数与区间最小距离；相接且连续满足条件的区间合并；瞬时触及忽略；
+        - 合法但任何车对都未相遇返回空列表。
+        """
+        if not isinstance(zone_id, str) or not zone_id.strip():
+            raise ValidationError("zone_id 必须是非空字符串")
+        zone_id = zone_id.strip()
+
+        # ---- 请求校验（时间范围 / 车次互异 / 距离阈值 / 逐车版本格式）----
+        trip_ids_raw = payload.get("trip_ids")
+        if not isinstance(trip_ids_raw, list) or len(trip_ids_raw) < 2:
+            raise ValidationError("trip_ids 必须包含至少两辆车次")
+        trip_ids: List[str] = []
+        for idx, tid in enumerate(trip_ids_raw):
+            if not isinstance(tid, str) or not tid.strip():
+                raise ValidationError(f"trip_ids[{idx}] 必须是非空字符串")
+            tid = tid.strip()
+            if tid in trip_ids:
+                raise ValidationError(f"trip_ids 中车次重复: {tid!r}（各车次必须互异）")
+            trip_ids.append(tid)
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ValidationError("since/until 必须是有限时刻")
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        threshold_raw = payload.get("distance_threshold_m")
+        if isinstance(threshold_raw, bool):
+            raise ValidationError("distance_threshold_m 必须是数值，不能为布尔值")
+        try:
+            threshold = float(threshold_raw)
+        except (TypeError, ValueError):
+            raise ValidationError(
+                f"distance_threshold_m 必须是以米为单位的数值，收到: {threshold_raw!r}"
+            )
+        if not math.isfinite(threshold):
+            raise ValidationError("distance_threshold_m 必须有限，禁止 NaN/Infinity")
+        if threshold <= 0.0:
+            raise ValidationError(
+                f"distance_threshold_m 必须为正（米），收到: {threshold}"
+            )
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        track_versions_raw = payload.get("track_versions") or {}
+        if not isinstance(track_versions_raw, dict):
+            raise ValidationError("track_versions 必须是 {车次: 版本号} 对象")
+        pinned_versions: Dict[str, int] = {}
+        for tid, raw_v in track_versions_raw.items():
+            if tid not in trip_ids:
+                raise ValidationError(
+                    f"track_versions 包含未在 trip_ids 中的车次: {tid!r}"
+                )
+            pinned_versions[tid] = self._validate_track_version_value(raw_v)
+
+        # ---- 同一已提交读视图：区域 + 全部车次点集一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                zrow = self.db._zone_row_at(conn, zone_id, revision)
+                if zrow is None:
+                    raise NotFoundError(
+                        f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                    )
+            else:
+                zrow = self.db._latest_zone_row(conn, zone_id)
+                if zrow is None:
+                    raise NotFoundError(f"危险区不存在: {zone_id}")
+
+            per_trip: List[Tuple[str, int, List[Any]]] = []
+            for tid in trip_ids:
+                if tid in pinned_versions:
+                    version = pinned_versions[tid]
+                    baseline, head = self.db._trip_version_info(conn, tid)
+                    self._check_track_version_range(tid, version, baseline, head)
+                    points = self.db._list_trip_point_version_rows(conn, tid, version)
+                else:
+                    vrow = self.db._trip_version_row(conn, tid)
+                    points = self.db._list_trip_points(conn, tid)
+                    if vrow is None and not points:
+                        raise NotFoundError(f"车次不存在（无轨迹数据）: {tid}")
+                    version = 0 if vrow is None else int(vrow["version"])
+                per_trip.append((tid, version, points))
+
+            # 各车在区内的占用区间（同一快照数据，纯计算；已含窗口/带洞/插值/裁剪规则）
+            occupancy: Dict[str, List[Tuple[float, float]]] = {
+                tid: self._coverage_intervals(zrow, points, lo, hi)
+                for tid, _version, points in per_trip
+            }
+            point_sets: Dict[str, List[Any]] = {
+                tid: points for tid, _version, points in per_trip
+            }
+
+        # ---- 逐无序车对：同时在区内且双方轨迹覆盖的时间内比较同一时刻距离 ----
+        # 车对按车次 ID 排序规范化，与请求中的车次顺序无关
+        ordered_ids = sorted(trip_ids)
+        pairs_out: List[Dict[str, Any]] = []
+        for i in range(len(ordered_ids)):
+            for j in range(i + 1, len(ordered_ids)):
+                ta, tb = ordered_ids[i], ordered_ids[j]
+                intervals = self._encounter_intervals_for_pair(
+                    point_sets[ta], point_sets[tb],
+                    occupancy[ta], occupancy[tb],
+                    threshold,
+                )
+                if not intervals:
+                    continue  # 合法无相遇的车对不出现在结果中
+                pairs_out.append(
+                    {
+                        "trip_ids": [ta, tb],
+                        "intervals": [
+                            {
+                                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                                "duration_sec": round(e - s, 6),
+                                "min_distance_m": round(dmin, 6),
+                            }
+                            for s, e, dmin in intervals
+                        ],
+                    }
+                )
+
+        result: Dict[str, Any] = {
+            "zone_id": zone_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "distance_threshold_m": threshold,
+            "trips": [
+                {
+                    "trip_id": tid,
+                    "track_version": version,
+                    "point_count": len(points),
+                }
+                for tid, version, points in per_trip
+            ],
+            "pairs": pairs_out,
+        }
+        if pinned_rev:
+            result["revision"] = revision
+        return result
+
+    @staticmethod
+    def _intersect_interval_lists(
+        a_intervals: List[Tuple[float, float]],
+        b_intervals: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        """两组已排序、互不相交的半开区间的交集（仍为半开）。"""
+        out: List[Tuple[float, float]] = []
+        ia = ib = 0
+        while ia < len(a_intervals) and ib < len(b_intervals):
+            lo = max(a_intervals[ia][0], b_intervals[ib][0])
+            hi = min(a_intervals[ia][1], b_intervals[ib][1])
+            if hi > lo:
+                out.append((lo, hi))
+            if a_intervals[ia][1] <= b_intervals[ib][1]:
+                ia += 1
+            else:
+                ib += 1
+        return out
+
+    @staticmethod
+    def _segment_at(points: List[Any], t: float) -> Optional[Tuple[Any, Any]]:
+        """返回覆盖时刻 t 的相邻点段 (a, b)（点按 ts_epoch 升序）；无覆盖返回 None。"""
+        if not points or t < points[0]["ts_epoch"] or t >= points[-1]["ts_epoch"]:
+            return None
+        lo_idx, hi_idx = 0, len(points) - 1
+        # 二分最后一个 ts_epoch <= t 的点
+        while lo_idx < hi_idx:
+            mid = (lo_idx + hi_idx + 1) // 2
+            if points[mid]["ts_epoch"] <= t:
+                lo_idx = mid
+            else:
+                hi_idx = mid - 1
+        if lo_idx + 1 >= len(points):
+            return None
+        a, b = points[lo_idx], points[lo_idx + 1]
+        if b["ts_epoch"] <= a["ts_epoch"]:
+            return None
+        return a, b
+
+    def _encounter_intervals_for_pair(
+        self,
+        points_a: List[Any],
+        points_b: List[Any],
+        occ_a: List[Tuple[float, float]],
+        occ_b: List[Tuple[float, float]],
+        threshold: float,
+    ) -> List[Tuple[float, float, float]]:
+        """计算一对车在双方同时位于区内且均有轨迹覆盖时，平面距离严格小于阈值的区间。
+
+        位置均为相邻点间的时间-空间线性插值；在每个原子时间段内相对位移为匀速，
+        平方距离 Δ(t)·Δ(t) 是 t 的二次函数，据此精确求解严格不等式
+        ``dist(t) < threshold``。相接（端点重合）且连续满足条件的区间合并；
+        瞬时（零时长）触及忽略。返回 (start, end, 区间最小距离) 列表。
+        """
+        # 双方占用区间之交即“同时位于区内”；占用区间本身已被查询窗口半开裁剪
+        domains = self._intersect_interval_lists(occ_a, occ_b)
+        if not domains or not points_a or not points_b:
+            return []
+
+        # 原子分界：域端点 + 落在域内的任一方轨迹点时刻（线性段在此切换）
+        breaks_set: set = set()
+        for s, e in domains:
+            breaks_set.add(s)
+            breaks_set.add(e)
+        for pts in (points_a, points_b):
+            for r in pts:
+                t = r["ts_epoch"]
+                if any(s < t < e for s, e in domains):
+                    breaks_set.add(t)
+        breaks = sorted(breaks_set)
+
+        raw: List[Tuple[float, float, float]] = []
+        th2 = threshold * threshold
+        for idx in range(len(breaks) - 1):
+            s, e = breaks[idx], breaks[idx + 1]
+            if e - s <= self.min_duration:
+                continue
+            # 该原子段必须整体落在某一共同占用域内
+            if not any(ds <= s and e <= de for ds, de in domains):
+                continue
+            seg_a = self._segment_at(points_a, s)
+            seg_b = self._segment_at(points_b, s)
+            if seg_a is None or seg_b is None:
+                continue  # 某方无轨迹覆盖：不比较
+            a0, a1 = seg_a
+            b0, b1 = seg_b
+            dta = a1["ts_epoch"] - a0["ts_epoch"]
+            dtb = b1["ts_epoch"] - b0["ts_epoch"]
+            vax, vay = (a1["x"] - a0["x"]) / dta, (a1["y"] - a0["y"]) / dta
+            vbx, vby = (b1["x"] - b0["x"]) / dtb, (b1["y"] - b0["y"]) / dtb
+
+            length = e - s
+            # 以 u = t - s ∈ [0, length] 参数化相对位移
+            pa_sx = a0["x"] + vax * (s - a0["ts_epoch"])
+            pa_sy = a0["y"] + vay * (s - a0["ts_epoch"])
+            pb_sx = b0["x"] + vbx * (s - b0["ts_epoch"])
+            pb_sy = b0["y"] + vby * (s - b0["ts_epoch"])
+            dx0, dy0 = pa_sx - pb_sx, pa_sy - pb_sy
+            rvx, rvy = vax - vbx, vay - vby
+
+            alpha = rvx * rvx + rvy * rvy
+            beta = 2.0 * (dx0 * rvx + dy0 * rvy)
+            gamma = dx0 * dx0 + dy0 * dy0 - th2
+
+            sub: List[Tuple[float, float]] = []
+            if alpha <= 1e-18:
+                # 相对静止：整段同时满足或同时不满足严格不等式
+                if gamma < 0.0:
+                    sub.append((0.0, length))
+            else:
+                disc = beta * beta - 4.0 * alpha * gamma
+                if disc > 0.0:
+                    root = math.sqrt(disc)
+                    u1 = (-beta - root) / (2.0 * alpha)
+                    u2 = (-beta + root) / (2.0 * alpha)
+                    lo_u = max(0.0, u1)
+                    hi_u = min(length, u2)
+                    # 严格小于：端点距离恰为阈值（u1/u2）按半开排除，单根相切无正时长
+                    if hi_u - lo_u > 0.0:
+                        sub.append((lo_u, hi_u))
+
+            for u1, u2 in sub:
+                vs, ve = s + u1, s + u2
+                if ve - vs <= self.min_duration:
+                    continue
+                # 区间最小距离（米）：二次平方距离的最小值开根号
+                if alpha <= 1e-18:
+                    min_d2 = gamma + th2
+                else:
+                    u_star = min(max(-beta / (2.0 * alpha), u1), u2)
+                    min_d2 = alpha * u_star * u_star + beta * u_star + gamma + th2
+                raw.append((vs, ve, math.sqrt(max(0.0, min_d2))))
+
+        # 相接且连续满足条件的区间合并（吸收 1e-6 秒浮点缝隙）；瞬时触及已在上面剔除
+        merged: List[Tuple[float, float, float]] = []
+        for s, e, dmin in raw:
+            if merged and s - merged[-1][1] <= 1e-6:
+                ps, _pe, pdmin = merged[-1]
+                merged[-1] = (ps, e, min(pdmin, dmin))
+            else:
+                merged.append((s, e, dmin))
+        return [(s, e, dmin) for s, e, dmin in merged if e - s > self.min_duration]

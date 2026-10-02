@@ -1,9 +1,10 @@
 """HTTP 请求/响应模型（Pydantic；坐标数值校验在服务层做有限性检查）。"""
 from __future__ import annotations
 
+import math
 from typing import Annotated, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 
 class CoordModel(BaseModel):
@@ -102,3 +103,42 @@ class CoOccupancyQuery(BaseModel):
         default_factory=dict,
         description="可选逐车轨迹版本 {trip_id: 版本号}；未列出的车次取查询时最新已提交状态",
     )
+
+
+def _reject_bool_for_distance(value: object) -> object:
+    """距离阈值不接受布尔值（须在 Pydantic 数值强制转换之前拦截）。"""
+    if isinstance(value, bool):
+        raise ValueError("distance_threshold_m 必须是数值，不能为布尔值")
+    return value
+
+
+class ProximityEncounterQuery(BaseModel):
+    """多车近距离相遇审计请求：两车均在区内且轨迹覆盖时，同一时刻平面距离严格小于阈值的正时长区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trip_ids: List[str] = Field(
+        ..., min_length=2, description="至少两辆互异车次（重复车次在服务层拒绝）"
+    )
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    distance_threshold_m: Annotated[
+        float,
+        BeforeValidator(_reject_bool_for_distance),
+        Field(description="米制距离阈值：必须为正且有限（NaN/Infinity/<=0 在服务层拒绝）"),
+    ]
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_versions: Dict[str, Annotated[int, Field(ge=0)]] = Field(
+        default_factory=dict,
+        description="可选逐车轨迹版本 {trip_id: 版本号}；未列出的车次取查询时最新已提交状态",
+    )
+
+    @field_validator("distance_threshold_m")
+    @classmethod
+    def _threshold_finite(cls, value: float) -> float:
+        # 有限性（NaN/Infinity）在此拒绝，正值在服务层给出明确 400 报错
+        if not math.isfinite(value):
+            raise ValueError("distance_threshold_m 必须有限，禁止 NaN/Infinity")
+        return value
